@@ -3,12 +3,10 @@ import json
 import subprocess
 import sys
 import re
-import csv
-import io
 import time
 import pandas as pd
 
-st.set_page_config(page_title="VaxiJen Batch API", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="VaxiJen API", page_icon="🧬", layout="wide")
 
 @st.cache_resource
 def install_camoufox():
@@ -21,18 +19,28 @@ with st.spinner("Installing Camoufox (first run only)..."):
 TARGETS = ["bacteria", "virus", "tumour", "parasite", "fungal"]
 SCRIPT_URL = "https://www.ddg-pharmfac.net/vaxijen/scripts/VaxiJen_scripts/VaxiJen3.pl"
 
+params = st.query_params
+mode = params.get("mode", "")
 
-def get_cloudflare_session():
-    from camoufox.sync_api import Camoufox
+# --- JSON API mode (for JS polling) ---
+if mode == "upload" and "seqs" in params:
     import httpx
+    from camoufox.sync_api import Camoufox
 
+    sequences = json.loads(params["seqs"])
+    target = params.get("target", "bacteria")
+    threshold = float(params.get("threshold", "0.5"))
+    job_id = params.get("job", str(int(time.time())))
+
+    if "results" not in st.session_state:
+        st.session_state.results = {}
+    if job_id not in st.session_state.results:
+        st.session_state.results[job_id] = {"total": len(sequences), "done": 0, "data": []}
+
+    # Get CF session
     with Camoufox(headless="virtual", humanize=True) as browser:
         page = browser.new_page()
-        page.goto(
-            "https://www.ddg-pharmfac.net/vaxijen/VaxiJen/VaxiJen.html",
-            wait_until="networkidle",
-            timeout=90000,
-        )
+        page.goto("https://www.ddg-pharmfac.net/vaxijen/VaxiJen/VaxiJen.html", wait_until="networkidle", timeout=90000)
         title = page.title()
         if "Just a moment" in title:
             for _ in range(30):
@@ -40,132 +48,139 @@ def get_cloudflare_session():
                 title = page.title()
                 if "Just a moment" not in title:
                     break
-        if "Just a moment" in title:
-            return None
-
         all_cookies = page.context.cookies()
         user_agent = page.evaluate("navigator.userAgent")
         cf_cookies = {c["name"]: c["value"] for c in all_cookies if "ddg-pharmfac" in c.get("domain", "")}
 
     cookie_str = "; ".join(f"{k}={v}" for k, v in cf_cookies.items())
-    return {
-        "headers": {
-            "User-Agent": user_agent,
-            "Cookie": cookie_str,
-            "Accept": "text/html",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-    }
+    headers = {"User-Agent": user_agent, "Cookie": cookie_str, "Accept": "text/html", "Content-Type": "application/x-www-form-urlencoded"}
 
+    with httpx.Client(timeout=60, follow_redirects=True, headers=headers) as client:
+        for i, seq in enumerate(sequences):
+            resp = client.post(SCRIPT_URL, data={"seq": seq, "Target": target, "threshold": str(threshold), "submit": "Submit"})
+            prediction = score = None
+            if "Overall Prediction" in resp.text:
+                for line in resp.text.split("\n"):
+                    if "Overall Prediction" in line:
+                        m = re.search(r"=\s*<?b?>?\s*([\d.]+)", line)
+                        if m: score = float(m.group(1))
+                        upper = line.upper()
+                        if "NON-ANTIGEN" in upper: prediction = "Non-antigen"
+                        elif "ANTIGEN" in upper: prediction = "Probable ANTIGEN"
+                        break
+            st.session_state.results[job_id]["data"].append({"sequence": seq[:50], "prediction": prediction, "score": score})
+            st.session_state.results[job_id]["done"] = i + 1
+            time.sleep(1)
 
-def predict_single(client, sequence, target, threshold):
-    resp = client.post(SCRIPT_URL, data={
-        "seq": sequence,
-        "Target": target,
-        "threshold": str(threshold),
-        "submit": "Submit",
-    })
-    if "Overall Prediction" not in resp.text:
-        return None, None
+    st.session_state.results[job_id]["status"] = "complete"
+    st.json(st.session_state.results[job_id])
+    st.stop()
 
-    prediction = score = None
-    for line in resp.text.split("\n"):
-        if "Overall Prediction" in line:
-            m = re.search(r"=\s*<?b?>?\s*([\d.]+)", line)
-            if m:
-                score = float(m.group(1))
-            upper = line.upper()
-            if "NON-ANTIGEN" in upper:
-                prediction = "Non-antigen"
-            elif "ANTIGEN" in upper:
-                prediction = "Probable ANTIGEN"
-            break
-    return prediction, score
+# --- Poll mode ---
+if mode == "poll":
+    job_id = params.get("job", "")
+    if job_id and "results" in st.session_state and job_id in st.session_state.results:
+        st.json(st.session_state.results[job_id])
+    else:
+        st.json({"error": "job not found"})
+    st.stop()
 
-
-def predict_with_camoufox(sequence, target, threshold):
-    from camoufox.sync_api import Camoufox
-    import httpx
-
-    session = get_cloudflare_session()
-    if not session:
-        return None, None, "Cloudflare blocked"
-
-    with httpx.Client(timeout=60, follow_redirects=True, headers=session["headers"]) as client:
-        prediction, score = predict_single(client, sequence, target, threshold)
-        if prediction is None:
-            return None, None, "Unexpected response"
-        return prediction, score, None
-
-
-# --- UI ---
+# --- Normal UI mode ---
 st.title("🧬 VaxiJen Batch Predictor")
 
-mode = st.radio("Mode", ["Single Sequence", "CSV Batch"], horizontal=True)
+upload_col, poll_col = st.columns(2)
 
-if mode == "Single Sequence":
-    sequence = st.text_area("Protein Sequence", value="MALWMRLLPLLALLALWGPDPAAAFVNQHLCGSHLVEALYLVCGERGFFYTPK", height=100)
-    col1, col2 = st.columns(2)
-    with col1:
-        target = st.selectbox("Target Organism", TARGETS)
-    with col2:
-        threshold = st.number_input("Threshold", value=0.5, min_value=0.0, max_value=1.0, step=0.1)
-
-    if st.button("🧬 Predict", type="primary"):
-        with st.spinner("Running..."):
-            prediction, score, error = predict_with_camoufox(sequence, target, threshold)
-        if error:
-            st.error(error)
-        else:
-            c1, c2 = st.columns(2)
-            with c1: st.metric("Prediction", prediction)
-            with c2: st.metric("Score", f"{score:.4f}" if score else "N/A")
-
-else:
-    st.markdown("Upload a CSV with columns: `sequence` (required), `target` (optional, default: bacteria), `threshold` (optional, default: 0.5)")
-    uploaded = st.file_uploader("Choose CSV", type="csv")
+with upload_col:
+    st.subheader("Upload Sequences")
+    uploaded = st.file_uploader("CSV with 'sequence' column", type="csv")
+    target = st.selectbox("Target", TARGETS)
+    threshold = st.number_input("Threshold", value=0.5, min_value=0.0, max_value=1.0, step=0.1)
 
     if uploaded:
         df = pd.read_csv(uploaded)
-        st.dataframe(df.head(10))
-        st.info(f"{len(df)} sequences to process")
+        st.dataframe(df.head(5))
+        st.info(f"{len(df)} sequences")
 
-        if st.button("🚀 Run Batch Prediction", type="primary"):
-            st.info("Getting Cloudflare session...")
-            session = get_cloudflare_session()
-            if not session:
-                st.error("Cloudflare blocked")
-            else:
-                results = []
-                progress = st.progress(0)
-                status = st.empty()
+        if st.button("🚀 Start Batch", type="primary"):
+            job_id = str(int(time.time()))
+            sequences = df["sequence"].tolist()
+            st.session_state.current_job = job_id
+            st.session_state.current_sequences = sequences
+            st.session_state.current_target = target
+            st.session_state.current_threshold = threshold
+            st.session_state.processing = True
 
-                import httpx
-                with httpx.Client(timeout=60, follow_redirects=True, headers=session["headers"]) as client:
-                    for i, row in df.iterrows():
-                        seq = str(row.get("sequence", ""))
-                        tgt = str(row.get("target", "bacteria"))
-                        thr = float(row.get("threshold", 0.5))
+with poll_col:
+    st.subheader("Job Status")
 
-                        if not seq:
-                            continue
+    if st.session_state.get("processing"):
+        job_id = st.session_state.current_job
+        sequences = st.session_state.current_sequences
+        target = st.session_state.current_target
+        threshold = st.session_state.current_threshold
 
-                        status.text(f"Processing {i+1}/{len(df)}: {seq[:30]}...")
-                        prediction, score = predict_single(client, seq, tgt, thr)
+        if "results" not in st.session_state:
+            st.session_state.results = {}
+        st.session_state.results[job_id] = {"total": len(sequences), "done": 0, "data": [], "status": "running"}
 
-                        results.append({
-                            "sequence": seq,
-                            "target": tgt,
-                            "threshold": thr,
-                            "prediction": prediction,
-                            "score": score,
-                        })
-                        progress.progress((i + 1) / len(df))
-                        time.sleep(1)
+        st.info(f"Job: `{job_id}`")
+        st.code(f"Poll URL: ?mode=poll&job={job_id}", language=None)
 
-                result_df = pd.DataFrame(results)
-                st.dataframe(result_df)
+        import httpx
+        from camoufox.sync_api import Camoufox
 
-                csv_out = result_df.to_csv(index=False)
-                st.download_button("📥 Download Results CSV", csv_out, "vaxijen_results.csv", "text/csv")
-                st.success(f"Done! {len(results)} sequences processed")
+        progress = st.progress(0)
+        status = st.empty()
+
+        with Camoufox(headless="virtual", humanize=True) as browser:
+            page = browser.new_page()
+            page.goto("https://www.ddg-pharmfac.net/vaxijen/VaxiJen/VaxiJen.html", wait_until="networkidle", timeout=90000)
+            title = page.title()
+            if "Just a moment" in title:
+                for _ in range(30):
+                    time.sleep(2)
+                    title = page.title()
+                    if "Just a moment" not in title:
+                        break
+            all_cookies = page.context.cookies()
+            user_agent = page.evaluate("navigator.userAgent")
+            cf_cookies = {c["name"]: c["value"] for c in all_cookies if "ddg-pharmfac" in c.get("domain", "")}
+
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cf_cookies.items())
+        headers = {"User-Agent": user_agent, "Cookie": cookie_str, "Accept": "text/html", "Content-Type": "application/x-www-form-urlencoded"}
+
+        with httpx.Client(timeout=60, follow_redirects=True, headers=headers) as client:
+            for i, seq in enumerate(sequences):
+                status.text(f"Processing {i+1}/{len(sequences)}: {seq[:30]}...")
+                resp = client.post(SCRIPT_URL, data={"seq": seq, "Target": target, "threshold": str(threshold), "submit": "Submit"})
+                prediction = score = None
+                if "Overall Prediction" in resp.text:
+                    for line in resp.text.split("\n"):
+                        if "Overall Prediction" in line:
+                            m = re.search(r"=\s*<?b?>?\s*([\d.]+)", line)
+                            if m: score = float(m.group(1))
+                            upper = line.upper()
+                            if "NON-ANTIGEN" in upper: prediction = "Non-antigen"
+                            elif "ANTIGEN" in upper: prediction = "Probable ANTIGEN"
+                            break
+                st.session_state.results[job_id]["data"].append({"sequence": seq[:50], "prediction": prediction, "score": score})
+                st.session_state.results[job_id]["done"] = i + 1
+                progress.progress((i + 1) / len(sequences))
+                time.sleep(1)
+
+        st.session_state.results[job_id]["status"] = "complete"
+        st.session_state.processing = False
+
+        result_df = pd.DataFrame(st.session_state.results[job_id]["data"])
+        st.dataframe(result_df)
+        st.download_button("📥 Download Results", result_df.to_csv(index=False), "vaxijen_results.csv", "text/csv")
+        st.success("Done!")
+    else:
+        st.info("Upload CSV and click Start Batch")
+
+        job_id = st.text_input("Or enter Job ID to check:", "")
+        if job_id and "results" in st.session_state and job_id in st.session_state.results:
+            job = st.session_state.results[job_id]
+            st.metric("Progress", f"{job['done']}/{job['total']}")
+            if job["data"]:
+                st.dataframe(pd.DataFrame(job["data"]))
