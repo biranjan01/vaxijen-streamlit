@@ -1,10 +1,21 @@
 import streamlit as st
 import json
+import subprocess
+import sys
 
 st.set_page_config(page_title="VaxiJen Session Server", page_icon="🧬")
 
+# Install camoufox browser on first run
+@st.cache_resource
+def install_camoufox():
+    subprocess.check_call([sys.executable, "-m", "camoufox", "fetch"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
 st.title("🧬 VaxiJen Cloudflare Bypass")
 st.markdown("Solves Cloudflare and shows session cookies for use in camoufox-js")
+
+with st.spinner("Installing Camoufox browser (first run only)..."):
+    install_camoufox()
 
 if st.button("🚀 Solve Cloudflare"):
     with st.spinner("Launching Camoufox..."):
