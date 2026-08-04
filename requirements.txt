@@ -1,3 +1,4 @@
 streamlit
 camoufox
 httpx
+pandas
